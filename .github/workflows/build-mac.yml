@@ -1,0 +1,39 @@
+name: Build macOS App
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+  push:
+    branches: [ main ]
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyQt6 pillow numpy pyinstaller
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --windowed --onedir --clean --name="PC-98 STUDIO" pc98_studio.py
+
+      - name: Zip .app Bundle
+        run: |
+          cd dist
+          zip -r "PC-98-STUDIO-macOS.zip" "PC-98 STUDIO.app"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PC-98-STUDIO-macOS
+          path: dist/PC-98-STUDIO-macOS.zip
