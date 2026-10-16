@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 import ctypes
 
 # Windows taskbar grouping ID so the pinned/taskbar icon persists
@@ -29,15 +30,17 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from PyQt6.QtCore import Qt, QSize, pyqtSignal, QPoint, QRect
+    from PyQt6.QtCore import Qt, QSize, pyqtSignal, QPoint, QPointF, QRect, QRectF
     from PyQt6.QtGui import (
         QImage, QPixmap, QColor, QIcon, QPainter, QCursor,
-        QPen, QBrush, QFont, QKeySequence, QShortcut
+        QPen, QBrush, QFont, QKeySequence, QShortcut,
+        QConicalGradient, QPainterPath
     )
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QSlider, QComboBox, QCheckBox, QFileDialog,
-        QGroupBox, QScrollArea, QColorDialog, QSplitter, QMessageBox, QSpinBox
+        QGroupBox, QScrollArea, QColorDialog, QSplitter, QMessageBox, QSpinBox,
+        QStyle, QStyleOptionSlider
     )
     print("[PC-98 STUDIO] [3/4] PyQt6 GUI engine loaded.")
 except ImportError as e:
@@ -47,15 +50,736 @@ except ImportError as e:
     sys.exit(1)
 
 
-# --- Custom Interactive Widgets ---
+# --- Bayer Matrices for Dithering ---
+def get_bayer_matrix(n: int) -> np.ndarray:
+    if n == 2:
+        return np.array([[0, 2], [3, 1]], dtype=np.float32)
+    sub = get_bayer_matrix(n // 2)
+    top = np.hstack([4 * sub, 4 * sub + 2])
+    bot = np.hstack([4 * sub + 3, 4 * sub + 1])
+    return np.vstack([top, bot])
+
+BAYER_2X2 = get_bayer_matrix(2) / 4.0 - 0.5
+BAYER_4X4 = get_bayer_matrix(4) / 16.0 - 0.5
+BAYER_8X8 = get_bayer_matrix(8) / 64.0 - 0.5
+
+# Authentic PC-98 Hardware Palettes
+YUNO_PALETTE = np.array([
+    [0, 0, 0], [153, 170, 187], [255, 255, 255], [119, 51, 51],
+    [187, 119, 102], [238, 170, 153], [255, 221, 204], [85, 102, 204],
+    [187, 204, 255], [34, 34, 34], [68, 68, 68], [85, 102, 102],
+    [51, 153, 136], [255, 187, 102], [221, 68, 85], [255, 153, 170]
+], dtype=np.uint8)
+
+POSSESSIONER_PALETTE = np.array([
+    [0, 0, 0], [187, 187, 187], [255, 255, 255], [136, 68, 34],
+    [204, 102, 85], [238, 153, 136], [255, 187, 170], [0, 51, 102],
+    [34, 119, 136], [34, 170, 187], [68, 119, 68], [34, 153, 68],
+    [153, 187, 136], [255, 204, 0], [119, 0, 51], [238, 0, 0]
+], dtype=np.uint8)
+
+ACCENT_RAMPS = {
+    'purple': np.array([[85, 34, 119], [136, 51, 170], [187, 85, 221], [238, 170, 255]], dtype=np.uint8),
+    'green': np.array([[17, 68, 34], [34, 136, 68], [68, 204, 102], [170, 255, 187]], dtype=np.uint8),
+    'red': np.array([[102, 17, 34], [170, 34, 51], [238, 51, 68], [255, 153, 170]], dtype=np.uint8),
+    'blue': np.array([[17, 34, 85], [34, 85, 170], [51, 153, 238], [170, 221, 255]], dtype=np.uint8),
+}
+
+MASTER_SKIN_RAMP = np.array([
+    [85,  34,  34],   # Deep terracotta contour shadow
+    [136, 51,  51],   # Deep reddish shadow
+    [170, 85,  68],   # Rich warm terracotta
+    [204, 119, 85],   # Deep warm orange flesh
+    [221, 153, 119],  # Core healthy natural orange midtone
+    [238, 187, 153],  # Soft peach
+    [255, 204, 170],  # Pale warm blush highlight
+    [255, 238, 187],  # Bright warm creamy yellow highlight
+], dtype=np.float32)
+
+
+def snap_to_rgb444(palette: np.ndarray) -> np.ndarray:
+    return np.clip(np.round(palette.astype(np.float32) / 17.0) * 17, 0, 255).astype(np.uint8)
+
+
+def is_plausible_skin(r: int, g: int, b: int) -> bool:
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    if not (65 <= lum <= 230):
+        return False
+    if not (r > g and g >= b):
+        return False
+    rg = r - g
+    gb = g - b
+    if not (14 <= rg <= 80) or not (10 <= gb <= 65):
+        return False
+    diff = r - b
+    sat = diff / max(1.0, float(r))
+    return 0.15 <= sat <= 0.70
+
+
+def build_skin_ramp_8(base_pal: np.ndarray) -> np.ndarray:
+    skins = []
+    for c in base_pal:
+        if is_plausible_skin(int(c[0]), int(c[1]), int(c[2])):
+            skins.append(c.astype(np.float32))
+
+    if len(skins) > 0:
+        avg_skin = np.mean(skins, axis=0)
+        ref_mid = MASTER_SKIN_RAMP[4]
+        delta = np.clip((avg_skin - ref_mid) * 0.35, -20.0, 20.0)
+        weights = np.array([0.0, 0.2, 0.6, 1.0, 1.0, 0.7, 0.3, 0.0], dtype=np.float32)[:, None]
+        ramp = MASTER_SKIN_RAMP + delta[None, :] * weights
+        return snap_to_rgb444(np.clip(ramp, 0, 255))
+    else:
+        return snap_to_rgb444(MASTER_SKIN_RAMP)
+
+
+def resample_non_skin_colors(candidate_pal: np.ndarray, excluded_colors: list, num_needed: int) -> list:
+    filtered = []
+    for c in candidate_pal:
+        dists = [np.linalg.norm(c.astype(float) - np.array(exc).astype(float)) for exc in excluded_colors]
+        if min(dists) > 24.0:
+            filtered.append(c.astype(np.float32))
+
+    if len(filtered) == 0:
+        filtered = [
+            np.array([0, 0, 0], dtype=np.float32),
+            np.array([34, 34, 51], dtype=np.float32),
+            np.array([68, 68, 85], dtype=np.float32),
+            np.array([102, 102, 119], dtype=np.float32),
+            np.array([136, 136, 153], dtype=np.float32),
+            np.array([170, 187, 204], dtype=np.float32),
+            np.array([204, 221, 238], dtype=np.float32),
+            np.array([255, 255, 255], dtype=np.float32),
+        ]
+
+    chosen = []
+    has_black = any(np.linalg.norm(np.array(exc).astype(float) - np.array([0, 0, 0])) < 22.0 for exc in excluded_colors)
+    if not has_black:
+        chosen.append(np.array([0, 0, 0], dtype=np.float32))
+
+    has_white = any(np.linalg.norm(np.array(exc).astype(float) - np.array([255, 255, 255])) < 25.0 for exc in excluded_colors)
+    filtered_arr = np.array(filtered)
+    lums = 0.299 * filtered_arr[:, 0] + 0.587 * filtered_arr[:, 1] + 0.114 * filtered_arr[:, 2]
+    brightest_idx = np.argmax(lums)
+    if not has_white and lums[brightest_idx] > 180.0:
+        chosen.append(filtered[brightest_idx])
+
+    cands = [f for i, f in enumerate(filtered) if not any(np.array_equal(f, ch) for ch in chosen)]
+
+    while len(chosen) < num_needed and len(cands) > 0:
+        c_arr = np.array(cands)
+        ch_arr = np.array(chosen)
+        dists = np.linalg.norm(c_arr[:, None, :] - ch_arr[None, :, :], axis=2)
+        min_dists = np.min(dists, axis=1)
+
+        c_lums = 0.299 * c_arr[:, 0] + 0.587 * c_arr[:, 1] + 0.114 * c_arr[:, 2]
+        ch_lums = 0.299 * ch_arr[:, 0] + 0.587 * ch_arr[:, 1] + 0.114 * ch_arr[:, 2]
+        lum_spread = np.min(np.abs(c_lums[:, None] - ch_lums[None, :]), axis=1)
+
+        c_sats = np.max(c_arr, axis=1) - np.min(c_arr, axis=1)
+
+        scores = min_dists + 0.45 * lum_spread + 0.20 * c_sats
+        best_idx = np.argmax(scores)
+        chosen.append(cands.pop(best_idx))
+
+    fallback_spectrum = [
+        [0, 0, 0], [255, 255, 255], [34, 34, 51], [68, 85, 102],
+        [153, 170, 187], [102, 51, 85], [51, 102, 102], [221, 221, 238],
+        [51, 51, 68], [119, 136, 153], [85, 102, 119], [187, 204, 221]
+    ]
+    for fb in fallback_spectrum:
+        if len(chosen) >= num_needed:
+            break
+        arr_fb = np.array(fb, dtype=np.float32)
+        if min(np.linalg.norm(arr_fb - ch) for ch in chosen) > 20.0:
+            chosen.append(arr_fb)
+
+    return [np.array(c, dtype=np.uint8) for c in chosen[:num_needed]]
+
+
+def build_skin_accent_palette(base_pal: np.ndarray, hue_type: str, num_colors: int = 16, skin_focus: bool = False) -> np.ndarray:
+    skin_ramp = build_skin_ramp_8(base_pal)
+    accent_ramp = ACCENT_RAMPS[hue_type]
+
+    if num_colors == 8:
+        out = np.zeros((8, 3), dtype=np.uint8)
+        out[0] = [0, 0, 0]
+        out[1:4] = skin_ramp[1:4]
+        out[4:7] = accent_ramp[1:4]
+        out[7] = [255, 255, 255]
+        return snap_to_rgb444(out)
+
+    if skin_focus:
+        chosen_skins = list(skin_ramp[:8])
+        chosen_accents = list(accent_ramp[:4])
+        excluded = chosen_skins + chosen_accents
+        other_extras = resample_non_skin_colors(base_pal, excluded, 4)
+        full = chosen_skins + chosen_accents + other_extras
+        return snap_to_rgb444(np.array(full, dtype=np.uint8))
+    else:
+        chosen_skins = list(skin_ramp[::2])
+        chosen_accents = list(accent_ramp[:4])
+        excluded = chosen_skins + chosen_accents
+        other_extras = resample_non_skin_colors(base_pal, excluded, 8)
+        full = chosen_skins + chosen_accents + other_extras
+        return snap_to_rgb444(np.array(full, dtype=np.uint8))
+
+
+def apply_skin_focus_to_palette(pal: np.ndarray, base_pal: np.ndarray, num_colors: int = 16) -> np.ndarray:
+    num_skin = num_colors // 2
+    num_other = num_colors - num_skin
+
+    skin_ramp = list(build_skin_ramp_8(base_pal)[:num_skin])
+    other_colors = resample_non_skin_colors(pal, skin_ramp, num_other)
+    other_colors.sort(key=lambda c: 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2])
+
+    full = skin_ramp + other_colors
+    res = np.zeros((16, 3), dtype=np.uint8)
+    res[:num_colors] = np.array(full[:num_colors], dtype=np.uint8)
+    return snap_to_rgb444(res)
+
+
+def extract_balanced_palette(pil_img: Image.Image, k: int = 16) -> np.ndarray:
+    small = pil_img.resize((320, 200), Image.Resampling.BILINEAR)
+    quant_48 = small.quantize(colors=48, method=Image.Quantize.MEDIANCUT)
+    pal_48 = np.array(quant_48.getpalette()[:48 * 3]).reshape(48, 3).astype(np.float32)
+
+    lum = 0.299 * pal_48[:, 0] + 0.587 * pal_48[:, 1] + 0.114 * pal_48[:, 2]
+
+    sorted_lum_idx = np.argsort(lum)
+    darkest = pal_48[sorted_lum_idx[0]]
+    brightest = pal_48[sorted_lum_idx[-1]]
+
+    chosen = [darkest, brightest]
+    cands = [pal_48[i] for i in range(len(pal_48)) if i != sorted_lum_idx[0] and i != sorted_lum_idx[-1]]
+
+    while len(chosen) < k and len(cands) > 0:
+        c_arr = np.array(cands)
+        ch_arr = np.array(chosen)
+        dists = np.linalg.norm(c_arr[:, None, :] - ch_arr[None, :, :], axis=2)
+        min_dists = np.min(dists, axis=1)
+        c_sats = np.max(c_arr, axis=1) - np.min(c_arr, axis=1)
+        scores = min_dists + 0.15 * c_sats
+        best_idx = np.argmax(scores)
+        chosen.append(cands.pop(best_idx))
+
+    while len(chosen) < k:
+        chosen.append(np.array([128, 128, 128], dtype=np.float32))
+
+    arr_chosen = np.array(chosen[:k], dtype=np.uint8)
+    ch_lum = 0.299 * arr_chosen[:, 0] + 0.587 * arr_chosen[:, 1] + 0.114 * arr_chosen[:, 2]
+    return arr_chosen[np.argsort(ch_lum)]
+
+
+def adjust_palette_accents(base_pal: np.ndarray, mode: str) -> np.ndarray:
+    out = base_pal.astype(np.float32).copy()
+    for i in range(len(out)):
+        r, g, b = out[i]
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        sat = max(r, g, b) - min(r, g, b)
+
+        if sat > 18.0 and 22.0 < lum < 238.0:
+            if mode == "vibrant":
+                out[i] = np.clip(lum + (out[i] - lum) * 1.45, 0, 255)
+            elif mode == "warm":
+                out[i, 0] = np.clip(out[i, 0] * 1.18 + 10, 0, 255)
+                out[i, 1] = np.clip(out[i, 1] * 1.05, 0, 255)
+                out[i, 2] = np.clip(out[i, 2] * 0.82 - 8, 0, 255)
+            elif mode == "cool":
+                out[i, 0] = np.clip(out[i, 0] * 0.82 - 8, 0, 255)
+                out[i, 1] = np.clip(out[i, 1] * 1.08, 0, 255)
+                out[i, 2] = np.clip(out[i, 2] * 1.22 + 12, 0, 255)
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# --- Vectorized Fast HSL Color Engine ---
+def fast_rgb_to_hsl(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized conversion of float32 RGB [0, 1] to HSL (H in [0, 360], S/L in [0, 1])."""
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    l = (maxc + minc) * 0.5
+    delta = maxc - minc
+
+    mask = delta > 1e-5
+    s = np.zeros_like(l)
+    denom = np.where(l <= 0.5, maxc + minc, 2.0 - maxc - minc)
+    denom = np.where(mask, denom, 1.0)
+    s[mask] = delta[mask] / denom[mask]
+
+    h = np.zeros_like(l)
+    delta_safe = np.where(mask, delta, 1.0)
+    r_mask = mask & (maxc == r)
+    g_mask = mask & (maxc == g) & (~r_mask)
+    b_mask = mask & (maxc == b) & (~r_mask) & (~g_mask)
+
+    h[r_mask] = ((g[r_mask] - b[r_mask]) / delta_safe[r_mask]) % 6.0
+    h[g_mask] = ((b[g_mask] - r[g_mask]) / delta_safe[g_mask]) + 2.0
+    h[b_mask] = ((r[b_mask] - g[b_mask]) / delta_safe[b_mask]) + 4.0
+    h = h * 60.0
+    return h, s, l
+
+
+def fast_hsl_to_rgb(h: np.ndarray, s: np.ndarray, l: np.ndarray) -> np.ndarray:
+    """Vectorized conversion of HSL to float32 RGB [0, 1] using direct sector masks."""
+    h = h % 360.0
+    s = np.clip(s, 0.0, 1.0)
+    l = np.clip(l, 0.0, 1.0)
+
+    c = (1.0 - np.abs(2.0 * l - 1.0)) * s
+    x = c * (1.0 - np.abs(((h / 60.0) % 2.0) - 1.0))
+    m = l - c * 0.5
+
+    h_idx = (h / 60.0).astype(np.int32) % 6
+
+    r = np.zeros_like(h)
+    g = np.zeros_like(h)
+    b = np.zeros_like(h)
+
+    m0 = (h_idx == 0)
+    m1 = (h_idx == 1)
+    m2 = (h_idx == 2)
+    m3 = (h_idx == 3)
+    m4 = (h_idx == 4)
+    m5 = (h_idx == 5)
+
+    r[m0] = c[m0]; g[m0] = x[m0]
+    r[m1] = x[m1]; g[m1] = c[m1]
+    g[m2] = c[m2]; b[m2] = x[m2]
+    g[m3] = x[m3]; b[m3] = c[m3]
+    r[m4] = x[m4]; b[m4] = c[m4]
+    r[m5] = c[m5]; b[m5] = x[m5]
+
+    rgb = np.stack([r + m, g + m, b + m], axis=-1)
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def compute_hue_weight_vectorized(h_arr: np.ndarray, soft_min: float, hard_min: float, hard_max: float, soft_max: float) -> np.ndarray:
+    """Computes a C1 continuous weight [0, 1] for each hue given 4 angular limits."""
+    ref = soft_min % 360.0
+    t_h = (h_arr - ref) % 360.0
+    t_hard_min = (hard_min - ref) % 360.0
+    t_hard_max = (hard_max - ref) % 360.0
+    t_soft_max = (soft_max - ref) % 360.0
+
+    w = np.zeros_like(t_h, dtype=np.float32)
+
+    if t_hard_min > 1e-4:
+        mask_up = (t_h >= 0.0) & (t_h < t_hard_min)
+        u = t_h[mask_up] / t_hard_min
+        w[mask_up] = u * u * (3.0 - 2.0 * u)
+
+    mask_plat = (t_h >= t_hard_min) & (t_h <= t_hard_max)
+    w[mask_plat] = 1.0
+
+    if t_soft_max > t_hard_max + 1e-4:
+        mask_down = (t_h > t_hard_max) & (t_h <= t_soft_max)
+        v = (t_soft_max - t_h[mask_down]) / (t_soft_max - t_hard_max)
+        w[mask_down] = v * v * (3.0 - 2.0 * v)
+
+    return w
+
+
+def apply_hsl_transform(rgb_arr: np.ndarray, master_hsl: list, color_hsl_data: dict) -> np.ndarray:
+    """Applies master HSL and selective 4-point range color adjustments to an RGB array."""
+    is_master_zero = (master_hsl[0] == 0 and master_hsl[1] == 0 and master_hsl[2] == 0)
+    has_color_active = any(
+        d['shifts'][0] != 0 or d['shifts'][1] != 0 or d['shifts'][2] != 0
+        for d in color_hsl_data.values()
+    )
+    if is_master_zero and not has_color_active:
+        return rgb_arr
+
+    arr_norm = rgb_arr.astype(np.float32) / 255.0
+    h, s, l = fast_rgb_to_hsl(arr_norm)
+
+    if has_color_active:
+        tot_h_shift = np.zeros_like(h)
+        tot_s_mult = np.ones_like(s)
+        tot_l_shift = np.zeros_like(l)
+
+        for data in color_hsl_data.values():
+            dh, ds, dl = data['shifts']
+            if dh == 0 and ds == 0 and dl == 0:
+                continue
+            p0, p1, p2, p3 = data['range']
+            weight = compute_hue_weight_vectorized(h, p0, p1, p2, p3) * (s > 0.04)
+
+            if dh != 0:
+                tot_h_shift += weight * dh
+            if ds != 0:
+                tot_s_mult += weight * (ds / 100.0)
+            if dl != 0:
+                tot_l_shift += weight * (dl / 200.0)
+
+        h = (h + tot_h_shift) % 360.0
+        s = np.clip(s * np.maximum(0.0, tot_s_mult), 0.0, 1.0)
+        l = np.clip(l + tot_l_shift, 0.0, 1.0)
+
+    mh, ms, ml = master_hsl
+    if mh != 0:
+        h = (h + mh) % 360.0
+    if ms != 0:
+        s = np.clip(s * max(0.0, 1.0 + ms / 100.0), 0.0, 1.0)
+    if ml != 0:
+        if ml > 0:
+            l = l + (1.0 - l) * (ml / 100.0)
+        else:
+            l = l * (1.0 + ml / 100.0)
+
+    rgb_transformed = fast_hsl_to_rgb(h, s, l)
+    return rgb_transformed * 255.0
+
+
+# --- Interactive Photoshop/Affinity HSL Wheel Widget ---
+class HSLColorWheel(QWidget):
+    range_changed = pyqtSignal(list)
+    range_editing_finished = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(210, 210)
+        self.setMouseTracking(True)
+
+        self.color_key = 'master'
+        self.color_range = [325.0, 342.5, 17.5, 35.0]
+
+        self.r_outer = 84.0
+        self.r_inner = 64.0
+        self.handle_radius = 6.0
+
+        self.active_handle = None
+        self.hovered_handle = None
+        self.last_drag_angle = 0.0
+
+        self.wheel_pixmap = self.generate_wheel_pixmap(210, 210, self.r_outer, self.r_inner)
+
+    def generate_wheel_pixmap(self, w: int, h: int, r_out: float, r_in: float) -> QPixmap:
+        pix = QPixmap(w, h)
+        pix.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        cx, cy = w / 2.0, h / 2.0
+        grad = QConicalGradient(cx, cy, 0.0)
+        for deg in range(0, 361, 15):
+            grad.setColorAt(deg / 360.0, QColor.fromHsvF(((360 - deg) % 360) / 360.0, 1.0, 1.0))
+
+        path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
+        path.addEllipse(QPointF(cx, cy), r_out, r_out)
+        path.addEllipse(QPointF(cx, cy), r_in, r_in)
+        painter.fillPath(path, QBrush(grad))
+
+        painter.setPen(QPen(QColor(40, 40, 50, 180), 1.0))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), r_out, r_out)
+        painter.drawEllipse(QPointF(cx, cy), r_in, r_in)
+        painter.end()
+        return pix
+
+    def set_color_data(self, key: str, color_range: list):
+        self.color_key = key
+        self.color_range = list(color_range)
+        self.active_handle = None
+        self.update()
+
+    def angle_to_point(self, r: float, deg: float) -> QPointF:
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        rad = math.radians(deg)
+        return QPointF(cx + r * math.cos(rad), cy + r * math.sin(rad))
+
+    def get_handle_positions(self) -> list:
+        p0, p1, p2, p3 = self.color_range
+        return [
+            self.angle_to_point(self.r_outer, p0),
+            self.angle_to_point(self.r_inner, p1),
+            self.angle_to_point(self.r_inner, p2),
+            self.angle_to_point(self.r_outer, p3),
+        ]
+
+    def hit_test_handle(self, pt: QPointF):
+        if self.color_key == 'master':
+            return None
+        positions = self.get_handle_positions()
+        for idx, h_pos in enumerate(positions):
+            dist = math.hypot(pt.x() - h_pos.x(), pt.y() - h_pos.y())
+            # Generous 16.5px hit radius (increased from 10px) for effortless clicking and dragging
+            if dist <= self.handle_radius + 10.5:
+                return idx
+        return None
+
+    def is_on_hard_arc(self, pt: QPointF) -> bool:
+        if self.color_key == 'master':
+            return False
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        dist = math.hypot(pt.x() - cx, pt.y() - cy)
+        if not (self.r_inner - 10.0 <= dist <= self.r_outer + 10.0):
+            return False
+
+        angle = (math.degrees(math.atan2(pt.y() - cy, pt.x() - cx))) % 360.0
+        p1, p2 = self.color_range[1], self.color_range[2]
+        rel_angle = (angle - p1) % 360.0
+        span = (p2 - p1) % 360.0
+        return rel_angle <= span
+
+    def update_handle_position(self, handle_idx: int, new_angle: float):
+        p = list(self.color_range)
+        d_hard = (p[2] - p[1]) % 360.0
+        center = (p[1] + d_hard * 0.5) % 360.0
+        anti_center = (center + 180.0) % 360.0
+
+        q = [(x - anti_center) % 360.0 for x in p]
+        q_new = (new_angle - anti_center) % 360.0
+        min_gap = 2.0
+
+        if handle_idx == 0:
+            q[0] = min(q_new, q[1] - min_gap)
+        elif handle_idx == 1:
+            q[1] = max(q[0] + min_gap, min(q_new, q[2] - min_gap))
+        elif handle_idx == 2:
+            q[2] = max(q[1] + min_gap, min(q_new, q[3] - min_gap))
+        elif handle_idx == 3:
+            q[3] = max(q[2] + min_gap, q_new)
+
+        self.color_range = [(val + anti_center) % 360.0 for val in q]
+        self.range_changed.emit(self.color_range)
+
+    def rotate_range(self, delta_deg: float):
+        self.color_range = [(x + delta_deg) % 360.0 for x in self.color_range]
+        self.range_changed.emit(self.color_range)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            pt = event.position()
+            hit_idx = self.hit_test_handle(pt)
+            if hit_idx is not None:
+                self.active_handle = hit_idx
+            elif self.is_on_hard_arc(pt):
+                self.active_handle = 'arc'
+                cx, cy = self.width() / 2.0, self.height() / 2.0
+                self.last_drag_angle = (math.degrees(math.atan2(pt.y() - cy, pt.x() - cx))) % 360.0
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        pt = event.position()
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+        cur_angle = (math.degrees(math.atan2(pt.y() - cy, pt.x() - cx))) % 360.0
+
+        if self.active_handle is not None and self.color_key != 'master':
+            if isinstance(self.active_handle, int):
+                self.update_handle_position(self.active_handle, cur_angle)
+            elif self.active_handle == 'arc':
+                delta = (cur_angle - self.last_drag_angle)
+                norm_delta = (delta + 180.0) % 360.0 - 180.0
+                self.rotate_range(norm_delta)
+                self.last_drag_angle = cur_angle
+            self.update()
+        else:
+            old_hover = self.hovered_handle
+            self.hovered_handle = self.hit_test_handle(pt)
+            if self.hovered_handle is not None:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            elif self.is_on_hard_arc(pt):
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            if old_hover != self.hovered_handle:
+                self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self.active_handle is not None:
+            self.active_handle = None
+            self.range_editing_finished.emit()
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.drawPixmap(0, 0, self.wheel_pixmap)
+
+        if self.color_key == 'master':
+            painter.setPen(QColor(130, 140, 160))
+            font = QFont("Segoe UI", 11, QFont.Weight.Bold)
+            painter.setFont(font)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "ALL")
+            painter.end()
+            return
+
+        p0, p1, p2, p3 = self.color_range
+        pts = self.get_handle_positions()
+
+        span = (p2 - p1) % 360.0
+        steps = max(2, int(span / 3.0))
+        path = QPainterPath()
+        path.moveTo(pts[0])
+        path.lineTo(pts[1])
+        for i in range(1, steps + 1):
+            deg = (p1 + (span * i / steps)) % 360.0
+            path.lineTo(self.angle_to_point(self.r_inner, deg))
+        path.lineTo(pts[3])
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(15, 15, 20, 220), 4.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(path)
+        painter.setPen(QPen(QColor(255, 255, 255, 240), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(path)
+
+        for i, pos in enumerate(pts):
+            is_active = (i == self.active_handle or i == self.hovered_handle)
+            r = self.handle_radius + (1.5 if is_active else 0.0)
+
+            painter.setPen(QPen(QColor(20, 20, 25), 1.5))
+            fill_color = QColor(255, 255, 255) if is_active else QColor(215, 220, 230)
+            painter.setBrush(QBrush(fill_color))
+            painter.drawEllipse(pos, r, r)
+
+        painter.end()
+
+
+# --- Custom Interactive Swatch Button ---
+class ColorOptionButton(QPushButton):
+    def __init__(self, key: str, color_hex: str | None = None, is_master: bool = False, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.color_hex = color_hex
+        self.is_master = is_master
+        self.is_selected = False
+        self.current_qcolor = QColor(color_hex) if color_hex else None
+        self.setFixedSize(28, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def setSelected(self, selected: bool):
+        self.is_selected = selected
+        self.update()
+
+    def set_color_from_hue(self, hue_deg: float):
+        if not self.is_master:
+            self.current_qcolor = QColor.fromHslF((hue_deg % 360.0) / 360.0, 1.0, 0.5)
+            self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        cx, cy = self.width() / 2.0, self.height() / 2.0
+
+        if self.is_master:
+            grad = QConicalGradient(cx, cy, 0.0)
+            for deg in range(0, 361, 30):
+                grad.setColorAt(deg / 360.0, QColor.fromHsvF(((360 - deg) % 360) / 360.0, 1.0, 1.0))
+            painter.setBrush(QBrush(grad))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(cx, cy), 11.5, 11.5)
+        else:
+            col = self.current_qcolor if self.current_qcolor else QColor(self.color_hex)
+            painter.setBrush(QBrush(col))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(QPointF(cx, cy), 11.5, 11.5)
+
+        if self.is_selected:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(255, 255, 255), 2.5))
+            painter.drawEllipse(QPointF(cx, cy), 12.5, 12.5)
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(45, 45, 55), 1.0))
+            painter.drawEllipse(QPointF(cx, cy), 12.0, 12.0)
+
+        painter.end()
+
+
+# --- Wheel-Proof Controls for Scroll Areas ---
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class NoWheelSpinBox(QSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+# --- Interactive Clickable Number SpinBox for Sliders ---
+class ValueSpinBox(QSpinBox):
+    def __init__(self, min_val: int, max_val: int, default_val: int, suffix: str = "", parent=None):
+        super().__init__(parent)
+        self.setRange(min_val, max_val)
+        self.setValue(default_val)
+        self.setSuffix(suffix)
+        self.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setFixedWidth(54)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        self.setStyleSheet("""
+            QSpinBox {
+                background-color: #24242e;
+                border: 1px solid #3a3a48;
+                border-radius: 3px;
+                color: #ffffff;
+                font-family: 'Segoe UI', Arial;
+                font-size: 11px;
+                font-weight: bold;
+                padding: 1px 3px;
+            }
+            QSpinBox:hover {
+                border-color: #555566;
+            }
+            QSpinBox:focus {
+                border: 1px solid #5a88c8;
+                background-color: #1a1a24;
+            }
+        """)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self.selectAll()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.selectAll()
+
+
 class ResetableSlider(QSlider):
+    reset_requested = pyqtSignal()
+
     def __init__(self, orientation=Qt.Orientation.Horizontal, default_val=0, parent=None):
         super().__init__(orientation, parent)
         self.default_val = default_val
 
+    def wheelEvent(self, event):
+        event.ignore()
+
     def mouseDoubleClickEvent(self, event):
         self.setValue(self.default_val)
+        self.reset_requested.emit()
         event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            sr = self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider, opt,
+                QStyle.SubControl.SC_SliderHandle, self
+            )
+            # Generous hit area around the circular slider handle (+12 pixels radius)
+            expanded_rect = sr.adjusted(-12, -12, 12, 12)
+            if expanded_rect.contains(event.position().toPoint()):
+                super().mousePressEvent(event)
+            else:
+                handle_half = sr.width() / 2.0
+                track_len = max(1.0, float(self.width() - sr.width()))
+                rel_x = max(0.0, min(track_len, event.position().x() - handle_half))
+                val_range = self.maximum() - self.minimum()
+                new_val = int(round(self.minimum() + (rel_x / track_len) * val_range))
+                self.setValue(new_val)
+                super().mousePressEvent(event)
+        else:
+            super().mousePressEvent(event)
 
 
 class ZoomablePreviewCanvas(QWidget):
@@ -84,7 +808,6 @@ class ZoomablePreviewCanvas(QWidget):
             }
         """)
 
-        # Centered empty-state overlay without container borders
         self.empty_overlay = QWidget(self)
         self.empty_overlay.setStyleSheet("background: transparent; border: none;")
         empty_layout = QVBoxLayout(self.empty_overlay)
@@ -107,7 +830,6 @@ class ZoomablePreviewCanvas(QWidget):
         """)
         empty_layout.addWidget(self.lbl_empty_title)
 
-        # Minimal Load Image button matching the style of the section reset buttons
         self.btn_empty_load = QPushButton("Load Image")
         self.btn_empty_load.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_empty_load.setStyleSheet("""
@@ -147,12 +869,6 @@ class ZoomablePreviewCanvas(QWidget):
         self.current_qimg = qimg
         self.aspect_stretch = aspect_stretch
         self.update_empty_overlay()
-        self.update()
-
-    def set_nav_state(self, zoom: float, pan_x: float, pan_y: float):
-        self.zoom_factor = zoom
-        self.pan_x = pan_x
-        self.pan_y = pan_y
         self.update()
 
     def wheelEvent(self, event):
@@ -390,285 +1106,41 @@ class ColorSelectionDialog(QColorDialog):
         self.activateWindow()
 
 
-# --- Bayer Matrices for Dithering ---
-def get_bayer_matrix(n: int) -> np.ndarray:
-    if n == 2:
-        return np.array([[0, 2], [3, 1]], dtype=np.float32)
-    sub = get_bayer_matrix(n // 2)
-    top = np.hstack([4 * sub, 4 * sub + 2])
-    bot = np.hstack([4 * sub + 3, 4 * sub + 1])
-    return np.vstack([top, bot])
-
-BAYER_2X2 = get_bayer_matrix(2) / 4.0 - 0.5
-BAYER_4X4 = get_bayer_matrix(4) / 16.0 - 0.5
-BAYER_8X8 = get_bayer_matrix(8) / 64.0 - 0.5
-
-# Authentic PC-98 Hardware Palettes
-YUNO_PALETTE = np.array([
-    [0, 0, 0], [153, 170, 187], [255, 255, 255], [119, 51, 51],
-    [187, 119, 102], [238, 170, 153], [255, 221, 204], [85, 102, 204],
-    [187, 204, 255], [34, 34, 34], [68, 68, 68], [85, 102, 102],
-    [51, 153, 136], [255, 187, 102], [221, 68, 85], [255, 153, 170]
-], dtype=np.uint8)  # Extracted from YU-NO PC-98 assets[cite: 2]
-
-POSSESSIONER_PALETTE = np.array([
-    [0, 0, 0], [187, 187, 187], [255, 255, 255], [136, 68, 34],
-    [204, 102, 85], [238, 153, 136], [255, 187, 170], [0, 51, 102],
-    [34, 119, 136], [34, 170, 187], [68, 119, 68], [34, 153, 68],
-    [153, 187, 136], [255, 204, 0], [119, 0, 51], [238, 0, 0]
-], dtype=np.uint8)  # Extracted from Possessioner PC-98 assets and snapped to 12-bit[cite: 1]
-
-ACCENT_RAMPS = {
-    'purple': np.array([[85, 34, 119], [136, 51, 170], [187, 85, 221], [238, 170, 255]], dtype=np.uint8),
-    'green': np.array([[17, 68, 34], [34, 136, 68], [68, 204, 102], [170, 255, 187]], dtype=np.uint8),
-    'red': np.array([[102, 17, 34], [170, 34, 51], [238, 51, 68], [255, 153, 170]], dtype=np.uint8),
-    'blue': np.array([[17, 34, 85], [34, 85, 170], [51, 153, 238], [170, 221, 255]], dtype=np.uint8),
-}
-
-# Anchored Master PC-98 Skin Spectrum
-MASTER_SKIN_RAMP = np.array([
-    [85,  34,  34],   # 0: Deep dark red / terracotta contour shadow
-    [136, 51,  51],   # 1: Deep reddish shadow (subsurface contour)
-    [170, 85,  68],   # 2: Rich warm terracotta / burnt orange mid-shadow
-    [204, 119, 85],   # 3: Deep natural warm orange flesh
-    [221, 153, 119],  # 4: Core healthy natural orange midtone
-    [238, 187, 153],  # 5: Soft light peach
-    [255, 204, 170],  # 6: Pale warm blush highlight
-    [255, 238, 187],  # 7: Bright warm creamy yellow highlight
-], dtype=np.float32)
-
-
-def snap_to_rgb444(palette: np.ndarray) -> np.ndarray:
-    return np.clip(np.round(palette.astype(np.float32) / 17.0) * 17, 0, 255).astype(np.uint8)
-
-
-def is_plausible_skin(r: int, g: int, b: int) -> bool:
-    lum = 0.299 * r + 0.587 * g + 0.114 * b
-    if not (65 <= lum <= 230):
-        return False
-    if not (r > g and g >= b):
-        return False
-    rg = r - g
-    gb = g - b
-    if not (14 <= rg <= 80) or not (10 <= gb <= 65):
-        return False
-    diff = r - b
-    sat = diff / max(1.0, float(r))
-    return 0.15 <= sat <= 0.70
-
-
-def build_skin_ramp_8(base_pal: np.ndarray) -> np.ndarray:
-    """
-    Builds an 8-step skin ramp anchored to an authentic PC-98 base range:
-    Dark red shadows, healthy natural orange midtones, and bright creamy yellow highlights.
-    """
-    skins = []
-    for c in base_pal:
-        if is_plausible_skin(int(c[0]), int(c[1]), int(c[2])):
-            skins.append(c.astype(np.float32))
-
-    if len(skins) > 0:
-        avg_skin = np.mean(skins, axis=0)
-        ref_mid = MASTER_SKIN_RAMP[4]
-        delta = np.clip((avg_skin - ref_mid) * 0.35, -20.0, 20.0)
-        weights = np.array([0.0, 0.2, 0.6, 1.0, 1.0, 0.7, 0.3, 0.0], dtype=np.float32)[:, None]
-        ramp = MASTER_SKIN_RAMP + delta[None, :] * weights
-        return snap_to_rgb444(np.clip(ramp, 0, 255))
-    else:
-        return snap_to_rgb444(MASTER_SKIN_RAMP)
-
-
-def resample_non_skin_colors(candidate_pal: np.ndarray, excluded_colors: list, num_needed: int) -> list:
-    """
-    Resamples non-skin colors evenly across shadows, midtones, and highlights,
-    ensuring that neither end of the luminance spectrum is truncated.
-    """
-    filtered = []
-    for c in candidate_pal:
-        dists = [np.linalg.norm(c.astype(float) - np.array(exc).astype(float)) for exc in excluded_colors]
-        if min(dists) > 24.0:
-            filtered.append(c.astype(np.float32))
-
-    if len(filtered) == 0:
-        filtered = [
-            np.array([0, 0, 0], dtype=np.float32),
-            np.array([34, 34, 51], dtype=np.float32),
-            np.array([68, 68, 85], dtype=np.float32),
-            np.array([102, 102, 119], dtype=np.float32),
-            np.array([136, 136, 153], dtype=np.float32),
-            np.array([170, 187, 204], dtype=np.float32),
-            np.array([204, 221, 238], dtype=np.float32),
-            np.array([255, 255, 255], dtype=np.float32),
-        ]
-
-    chosen = []
-    # 1. Anchor deepest shadow if needed
-    has_black = any(np.linalg.norm(np.array(exc).astype(float) - np.array([0, 0, 0])) < 22.0 for exc in excluded_colors)
-    if not has_black:
-        chosen.append(np.array([0, 0, 0], dtype=np.float32))
-
-    # 2. Anchor brightest highlight if needed
-    has_white = any(np.linalg.norm(np.array(exc).astype(float) - np.array([255, 255, 255])) < 25.0 for exc in excluded_colors)
-    filtered_arr = np.array(filtered)
-    lums = 0.299 * filtered_arr[:, 0] + 0.587 * filtered_arr[:, 1] + 0.114 * filtered_arr[:, 2]
-    brightest_idx = np.argmax(lums)
-    if not has_white and lums[brightest_idx] > 180.0:
-        chosen.append(filtered[brightest_idx])
-
-    cands = [f for i, f in enumerate(filtered) if not any(np.array_equal(f, ch) for ch in chosen)]
-
-    # 3. Farthest-point sampling with luminance dispersion across all tiers
-    while len(chosen) < num_needed and len(cands) > 0:
-        c_arr = np.array(cands)
-        ch_arr = np.array(chosen)
-        dists = np.linalg.norm(c_arr[:, None, :] - ch_arr[None, :, :], axis=2)
-        min_dists = np.min(dists, axis=1)
-
-        c_lums = 0.299 * c_arr[:, 0] + 0.587 * c_arr[:, 1] + 0.114 * c_arr[:, 2]
-        ch_lums = 0.299 * ch_arr[:, 0] + 0.587 * ch_arr[:, 1] + 0.114 * ch_arr[:, 2]
-        lum_spread = np.min(np.abs(c_lums[:, None] - ch_lums[None, :]), axis=1)
-
-        c_sats = np.max(c_arr, axis=1) - np.min(c_arr, axis=1)
-
-        scores = min_dists + 0.45 * lum_spread + 0.20 * c_sats
-        best_idx = np.argmax(scores)
-        chosen.append(cands.pop(best_idx))
-
-    fallback_spectrum = [
-        [0, 0, 0], [255, 255, 255], [34, 34, 51], [68, 85, 102],
-        [153, 170, 187], [102, 51, 85], [51, 102, 102], [221, 221, 238],
-        [51, 51, 68], [119, 136, 153], [85, 102, 119], [187, 204, 221]
-    ]
-    for fb in fallback_spectrum:
-        if len(chosen) >= num_needed:
-            break
-        arr_fb = np.array(fb, dtype=np.float32)
-        if min(np.linalg.norm(arr_fb - ch) for ch in chosen) > 20.0:
-            chosen.append(arr_fb)
-
-    return [np.array(c, dtype=np.uint8) for c in chosen[:num_needed]]
-
-
-def build_skin_accent_palette(base_pal: np.ndarray, hue_type: str, num_colors: int = 16, skin_focus: bool = False) -> np.ndarray:
-    skin_ramp = build_skin_ramp_8(base_pal)
-    accent_ramp = ACCENT_RAMPS[hue_type]
-
-    if num_colors == 8:
-        out = np.zeros((8, 3), dtype=np.uint8)
-        out[0] = [0, 0, 0]
-        out[1:4] = skin_ramp[1:4]
-        out[4:7] = accent_ramp[1:4]
-        out[7] = [255, 255, 255]
-        return snap_to_rgb444(out)
-
-    if skin_focus:
-        chosen_skins = list(skin_ramp[:8])
-        chosen_accents = list(accent_ramp[:4])
-        excluded = chosen_skins + chosen_accents
-        other_extras = resample_non_skin_colors(base_pal, excluded, 4)
-        full = chosen_skins + chosen_accents + other_extras
-        return snap_to_rgb444(np.array(full, dtype=np.uint8))
-    else:
-        chosen_skins = list(skin_ramp[::2])
-        chosen_accents = list(accent_ramp[:4])
-        excluded = chosen_skins + chosen_accents
-        other_extras = resample_non_skin_colors(base_pal, excluded, 8)
-        full = chosen_skins + chosen_accents + other_extras
-        return snap_to_rgb444(np.array(full, dtype=np.uint8))
-
-
-def apply_skin_focus_to_palette(pal: np.ndarray, base_pal: np.ndarray, num_colors: int = 16) -> np.ndarray:
-    """
-    Allocates half of the palette to the full-spectrum skin ramp,
-    and resamples remaining colors evenly across shadows, midtones, and highlights.
-    """
-    num_skin = num_colors // 2
-    num_other = num_colors - num_skin
-
-    skin_ramp = list(build_skin_ramp_8(base_pal)[:num_skin])
-    other_colors = resample_non_skin_colors(pal, skin_ramp, num_other)
-    other_colors.sort(key=lambda c: 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2])
-
-    full = skin_ramp + other_colors
-    res = np.zeros((16, 3), dtype=np.uint8)
-    res[:num_colors] = np.array(full[:num_colors], dtype=np.uint8)
-    return snap_to_rgb444(res)
-
-
-def extract_balanced_palette(pil_img: Image.Image, k: int = 16) -> np.ndarray:
-    """
-    Continuous, stable palette extraction.
-    Anchors to luminance extremes and sorts colors by luminance to prevent chaotic slot-flipping.
-    """
-    small = pil_img.resize((320, 200), Image.Resampling.BILINEAR)
-    quant_48 = small.quantize(colors=48, method=Image.Quantize.MEDIANCUT)
-    pal_48 = np.array(quant_48.getpalette()[:48 * 3]).reshape(48, 3).astype(np.float32)
-
-    lum = 0.299 * pal_48[:, 0] + 0.587 * pal_48[:, 1] + 0.114 * pal_48[:, 2]
-
-    # Deterministic anchors: Deepest shadow and brightest highlight
-    sorted_lum_idx = np.argsort(lum)
-    darkest = pal_48[sorted_lum_idx[0]]
-    brightest = pal_48[sorted_lum_idx[-1]]
-
-    chosen = [darkest, brightest]
-    cands = [pal_48[i] for i in range(len(pal_48)) if i != sorted_lum_idx[0] and i != sorted_lum_idx[-1]]
-
-    # Farthest-point sampling with balanced saturation weighting
-    while len(chosen) < k and len(cands) > 0:
-        c_arr = np.array(cands)
-        ch_arr = np.array(chosen)
-        dists = np.linalg.norm(c_arr[:, None, :] - ch_arr[None, :, :], axis=2)
-        min_dists = np.min(dists, axis=1)
-        c_sats = np.max(c_arr, axis=1) - np.min(c_arr, axis=1)
-        scores = min_dists + 0.15 * c_sats
-        best_idx = np.argmax(scores)
-        chosen.append(cands.pop(best_idx))
-
-    while len(chosen) < k:
-        chosen.append(np.array([128, 128, 128], dtype=np.float32))
-
-    arr_chosen = np.array(chosen[:k], dtype=np.uint8)
-
-    # Sort palette slots by luminance so slot order stays constant during slider adjustments
-    ch_lum = 0.299 * arr_chosen[:, 0] + 0.587 * arr_chosen[:, 1] + 0.114 * arr_chosen[:, 2]
-    return arr_chosen[np.argsort(ch_lum)]
-
-
-def adjust_palette_accents(base_pal: np.ndarray, mode: str) -> np.ndarray:
-    out = base_pal.astype(np.float32).copy()
-    for i in range(len(out)):
-        r, g, b = out[i]
-        lum = 0.299 * r + 0.587 * g + 0.114 * b
-        sat = max(r, g, b) - min(r, g, b)
-
-        if sat > 18.0 and 22.0 < lum < 238.0:
-            if mode == "vibrant":
-                out[i] = np.clip(lum + (out[i] - lum) * 1.45, 0, 255)
-            elif mode == "warm":
-                out[i, 0] = np.clip(out[i, 0] * 1.18 + 10, 0, 255)
-                out[i, 1] = np.clip(out[i, 1] * 1.05, 0, 255)
-                out[i, 2] = np.clip(out[i, 2] * 0.82 - 8, 0, 255)
-            elif mode == "cool":
-                out[i, 0] = np.clip(out[i, 0] * 0.82 - 8, 0, 255)
-                out[i, 1] = np.clip(out[i, 1] * 1.08, 0, 255)
-                out[i, 2] = np.clip(out[i, 2] * 1.22 + 12, 0, 255)
-
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
+# --- Main Application Controller ---
 class PC98Studio(QMainWindow):
+    DEFAULT_COLOR_HSL = {
+        'red':     {'shifts': [0, 0, 0], 'range': [325.0, 342.5, 17.5, 35.0]},
+        'orange':  {'shifts': [0, 0, 0], 'range': [355.0, 12.5, 47.5, 65.0]},
+        'yellow':  {'shifts': [0, 0, 0], 'range': [25.0, 42.5, 77.5, 95.0]},
+        'green':   {'shifts': [0, 0, 0], 'range': [85.0, 102.5, 137.5, 155.0]},
+        'cyan':    {'shifts': [0, 0, 0], 'range': [145.0, 162.5, 197.5, 215.0]},
+        'blue':    {'shifts': [0, 0, 0], 'range': [205.0, 222.5, 257.5, 275.0]},
+        'magenta': {'shifts': [0, 0, 0], 'range': [265.0, 282.5, 317.5, 335.0]}
+    }
+
+    SWATCH_DEFS = [
+        ('master', None, True),
+        ('red', '#e53935', False),
+        ('orange', '#fb8c00', False),
+        ('yellow', '#fdd835', False),
+        ('green', '#43a047', False),
+        ('cyan', '#00acc1', False),
+        ('blue', '#1e88e5', False),
+        ('magenta', '#d81b60', False),
+    ]
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PC-98 STUDIO")
-        
+
         icon_path = resource_path("app_icon.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-            
+
         self.resize(1260, 780)
 
         self.source_image = None
+        self.cached_framed_image = None
         self.processed_indices = None
         self.original_image_palette = YUNO_PALETTE.copy()
         self.active_palette = YUNO_PALETTE.copy()
@@ -678,6 +1150,15 @@ class PC98Studio(QMainWindow):
         self.locked_colors = [False] * 16
         self.all_sliders = []
         self.is_updating = False
+
+        # Photoshop / Affinity style HSL state
+        self.master_hsl = [0, 0, 0]
+        self.color_hsl = {
+            k: {'shifts': list(v['shifts']), 'range': list(v['range'])}
+            for k, v in self.DEFAULT_COLOR_HSL.items()
+        }
+        self.current_color_key = 'master'
+        self.swatch_buttons = {}
 
         # Undo State Tracking
         self.undo_stack = []
@@ -689,7 +1170,6 @@ class PC98Studio(QMainWindow):
         self.apply_dark_theme()
         self.populate_palette_dropdown()
 
-        # Keyboard Shortcut for Undo
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.activated.connect(self.undo)
 
@@ -707,7 +1187,7 @@ class PC98Studio(QMainWindow):
         self.compare_toggle.stateChanged.connect(lambda: self.update_compare_layout())
         top_bar.addWidget(self.compare_toggle)
 
-        self.compare_combo = QComboBox()
+        self.compare_combo = NoWheelComboBox()
         self.compare_combo.addItems([
             "Above / Below (Original on Top)",
             "Side by Side (Original on Left)"
@@ -718,28 +1198,41 @@ class PC98Studio(QMainWindow):
 
         self.lbl_split = QLabel("View Split:")
         top_bar.addWidget(self.lbl_split)
-        self.slider_split = QSlider(Qt.Orientation.Horizontal)
+        self.slider_split = ResetableSlider(Qt.Orientation.Horizontal, default_val=50)
         self.slider_split.setRange(15, 85)
         self.slider_split.setValue(50)
-        self.slider_split.setFixedWidth(90)
+        self.slider_split.setFixedWidth(80)
         self.slider_split.valueChanged.connect(self.on_split_slider_moved)
         self.slider_split.setEnabled(False)
         top_bar.addWidget(self.slider_split)
 
-        top_bar.addSpacing(16)
+        self.spin_split = ValueSpinBox(15, 85, 50, "%")
+        self.spin_split.setFixedWidth(46)
+        self.spin_split.setEnabled(False)
+        self.slider_split.valueChanged.connect(self.spin_split.setValue)
+        self.spin_split.valueChanged.connect(self.slider_split.setValue)
+        top_bar.addWidget(self.spin_split)
+
+        top_bar.addSpacing(14)
         self.aspect_toggle = QCheckBox("CRT 1:1.2 Stretch")
         self.aspect_toggle.setChecked(False)
         self.aspect_toggle.toggled.connect(lambda: self.update_preview_display())
         top_bar.addWidget(self.aspect_toggle)
 
-        top_bar.addSpacing(16)
+        top_bar.addSpacing(14)
         top_bar.addWidget(QLabel("Zoom:"))
-        self.slider_view_zoom = QSlider(Qt.Orientation.Horizontal)
+        self.slider_view_zoom = ResetableSlider(Qt.Orientation.Horizontal, default_val=100)
         self.slider_view_zoom.setRange(5, 800)
         self.slider_view_zoom.setValue(100)
         self.slider_view_zoom.setFixedWidth(80)
         self.slider_view_zoom.valueChanged.connect(lambda v: self.set_viewport_zoom(v / 100.0))
         top_bar.addWidget(self.slider_view_zoom)
+
+        self.spin_view_zoom = ValueSpinBox(5, 800, 100, "%")
+        self.spin_view_zoom.setFixedWidth(52)
+        self.slider_view_zoom.valueChanged.connect(self.spin_view_zoom.setValue)
+        self.spin_view_zoom.valueChanged.connect(lambda v: self.set_viewport_zoom(v / 100.0))
+        top_bar.addWidget(self.spin_view_zoom)
 
         btn_fit = QPushButton("↺ Fit")
         btn_fit.setToolTip("Reset Zoom to 100% (Fit) and center view")
@@ -778,7 +1271,7 @@ class PC98Studio(QMainWindow):
         layout = QVBoxLayout(controls_widget)
         layout.setSpacing(10)
 
-        # 1. Source & Resolution Framing
+        # 1. Resolution & Framing
         io_group = QGroupBox("1. Resolution & Framing")
         io_layout = QVBoxLayout(io_group)
         btn_open = QPushButton("Open Source Image")
@@ -788,7 +1281,7 @@ class PC98Studio(QMainWindow):
 
         res_box = QHBoxLayout()
         res_box.addWidget(QLabel("Resolution Scale:"))
-        self.res_combo = QComboBox()
+        self.res_combo = NoWheelComboBox()
         self.res_combo.addItems([
             "x1 Base (640x400 standard)",
             "x0.5 Half (320x200 low-res)",
@@ -801,7 +1294,7 @@ class PC98Studio(QMainWindow):
 
         aspect_box = QHBoxLayout()
         aspect_box.addWidget(QLabel("Aspect Ratio Frame:"))
-        self.crop_aspect_combo = QComboBox()
+        self.crop_aspect_combo = NoWheelComboBox()
         self.crop_aspect_combo.addItems([
             "PC-98 Standard (16:10 / 640x400)",
             "Original",
@@ -815,13 +1308,13 @@ class PC98Studio(QMainWindow):
         custom_layout = QHBoxLayout(self.custom_dim_widget)
         custom_layout.setContentsMargins(0, 0, 0, 0)
         custom_layout.addWidget(QLabel("Width:"))
-        self.spin_custom_w = QSpinBox()
+        self.spin_custom_w = NoWheelSpinBox()
         self.spin_custom_w.setRange(16, 3840)
         self.spin_custom_w.setValue(640)
         self.spin_custom_w.valueChanged.connect(self.on_framing_changed)
         custom_layout.addWidget(self.spin_custom_w)
         custom_layout.addWidget(QLabel("Height:"))
-        self.spin_custom_h = QSpinBox()
+        self.spin_custom_h = NoWheelSpinBox()
         self.spin_custom_h.setRange(16, 2160)
         self.spin_custom_h.setValue(480)
         self.spin_custom_h.valueChanged.connect(self.on_framing_changed)
@@ -838,17 +1331,67 @@ class PC98Studio(QMainWindow):
         io_layout.addWidget(btn_rst_framing)
         layout.addWidget(io_group)
 
-        # 2. Pre-Adjustments (Option A Gaussian blur for progressive softening)
+        # 2. Pre-Adjustments (Sharpness + Photoshop/Affinity HSL Color Wheel)
         pre_group = QGroupBox("2. Pre-Adjustments (Image Source)")
         pre_layout = QVBoxLayout(pre_group)
-        self.slider_contrast = self.create_slider("Contrast", -100, 100, 0, pre_layout, callback=self.on_preprocessing_changed)
-        self.slider_bright = self.create_slider("Brightness", -100, 100, 0, pre_layout, callback=self.on_preprocessing_changed)
-        self.slider_sat = self.create_slider("Saturation", -100, 100, 0, pre_layout, callback=self.on_preprocessing_changed)
-        self.slider_sharp = self.create_slider("Line Sharpness", -100, 100, 0, pre_layout, callback=self.on_preprocessing_changed)
 
-        btn_rst_pre = QPushButton("↺ Reset Pre-Adjustments")
+        self.slider_sharp = self.create_slider("Sharpness", -100, 100, 0, pre_layout, callback=self.on_preprocessing_changed)
+
+        lbl_wheel_title = QLabel("HSL Spectrum & Range:")
+        lbl_wheel_title.setStyleSheet("color: #a0b0d0; font-weight: bold; margin-top: 4px;")
+        pre_layout.addWidget(lbl_wheel_title)
+
+        wheel_container = QHBoxLayout()
+        self.hsl_wheel = HSLColorWheel()
+        self.hsl_wheel.range_changed.connect(self.on_wheel_range_changed)
+        self.hsl_wheel.range_editing_finished.connect(self.commit_state)
+        wheel_container.addStretch()
+        wheel_container.addWidget(self.hsl_wheel)
+        wheel_container.addStretch()
+        pre_layout.addLayout(wheel_container)
+
+        swatches_row = QHBoxLayout()
+        swatches_row.setSpacing(6)
+        swatches_row.addStretch()
+        for key, color_hex, is_master in self.SWATCH_DEFS:
+            btn = ColorOptionButton(key, color_hex, is_master=is_master)
+            btn.clicked.connect(lambda checked, k=key: self.select_color_swatch(k))
+            self.swatch_buttons[key] = btn
+            swatches_row.addWidget(btn)
+        swatches_row.addStretch()
+        pre_layout.addLayout(swatches_row)
+
+        self.lbl_active_target = QLabel("Overall Shifts:")
+        self.lbl_active_target.setStyleSheet("color: #a0b0d0; font-weight: bold; margin-top: 4px;")
+        pre_layout.addWidget(self.lbl_active_target)
+
+        self.slider_hue_shift = self.create_slider("Hue Shift", -180, 180, 0, pre_layout, "°", callback=self.on_active_hsl_slider_changed)
+        self.slider_sat_shift = self.create_slider("Saturation Shift", -100, 100, 0, pre_layout, "%", callback=self.on_active_hsl_slider_changed)
+        self.slider_light_shift = self.create_slider("Lightness Shift", -100, 100, 0, pre_layout, "%", callback=self.on_active_hsl_slider_changed)
+
+        # Hook Hue Shift reset to restore 0 AND restore original range parameters on the wheel
+        btn_rst_hue = self.slider_hue_shift.property("reset_button")
+        if btn_rst_hue:
+            try:
+                btn_rst_hue.clicked.disconnect()
+            except Exception:
+                pass
+            btn_rst_hue.clicked.connect(self.reset_hue_shift)
+            btn_rst_hue.setToolTip("Reset Hue Shift to 0° and restore original range parameters")
+
+        self.slider_hue_shift.reset_requested.connect(self.reset_hue_shift)
+
+        btn_row_pre = QHBoxLayout()
+        btn_rst_target = QPushButton("↺ Reset Selected Color")
+        btn_rst_target.setToolTip("Resets Hue/Sat/Light and range limits for the currently selected color")
+        btn_rst_target.clicked.connect(self.reset_current_color_hsl)
+        btn_row_pre.addWidget(btn_rst_target)
+
+        btn_rst_pre = QPushButton("↺ Reset All Pre-Adjustments")
         btn_rst_pre.clicked.connect(self.reset_image_adjustments)
-        pre_layout.addWidget(btn_rst_pre)
+        btn_row_pre.addWidget(btn_rst_pre)
+        pre_layout.addLayout(btn_row_pre)
+
         layout.addWidget(pre_group)
 
         # 3. Post-Color Editing
@@ -866,12 +1409,12 @@ class PC98Studio(QMainWindow):
         post_layout.addWidget(btn_rst_post)
         layout.addWidget(post_group)
 
-        # 4. Shading & Dithering (Default strength 50%)
+        # 4. Shading & Dithering
         dither_group = QGroupBox("4. Shading & Dithering")
         dither_layout = QVBoxLayout(dither_group)
         algo_box = QHBoxLayout()
         algo_box.addWidget(QLabel("Algorithm:"))
-        self.algo_combo = QComboBox()
+        self.algo_combo = NoWheelComboBox()
         self.algo_combo.addItems([
             "Bayer 4x4 (Classic PC-98 Crosshatch)",
             "Bayer 2x2 (Coarse)",
@@ -894,7 +1437,7 @@ class PC98Studio(QMainWindow):
         pal_group = QGroupBox("5. Palette Studio")
         pal_layout = QVBoxLayout(pal_group)
 
-        self.palette_combo = QComboBox()
+        self.palette_combo = NoWheelComboBox()
         self.palette_combo.setIconSize(QSize(180, 16))
         self.palette_combo.currentIndexChanged.connect(self.on_preset_changed)
         pal_layout.addWidget(self.palette_combo)
@@ -926,7 +1469,6 @@ class PC98Studio(QMainWindow):
         lock_btn_layout.addWidget(btn_unlock_all)
         pal_layout.addLayout(lock_btn_layout)
 
-        # 16 Color Buttons Grid
         grid_container = QWidget()
         grid = QVBoxLayout(grid_container)
         grid.setContentsMargins(0, 4, 0, 4)
@@ -972,20 +1514,20 @@ class PC98Studio(QMainWindow):
         pal_layout.addLayout(io_pal_box)
         layout.addWidget(pal_group)
 
-        # 6. Export Pipeline (Crisp Integer Upscaling 1x, 2x default, 4x, 8x)
+        # 6. Export Pipeline
         export_group = QGroupBox("6. Export Pipeline")
         exp_layout = QVBoxLayout(export_group)
 
         exp_scale_box = QHBoxLayout()
         exp_scale_box.addWidget(QLabel("Export Upscale:"))
-        self.export_upscale_combo = QComboBox()
+        self.export_upscale_combo = NoWheelComboBox()
         self.export_upscale_combo.addItems([
             "1x (Native Resolution)",
             "2x (Crisp Integer - Default)",
             "4x (Crisp Integer)",
             "8x (Crisp Integer)"
         ])
-        self.export_upscale_combo.setCurrentIndex(1)  # Default 2x
+        self.export_upscale_combo.setCurrentIndex(1)
         exp_scale_box.addWidget(self.export_upscale_combo)
         exp_layout.addLayout(exp_scale_box)
 
@@ -1000,6 +1542,9 @@ class PC98Studio(QMainWindow):
         main_splitter.setStretchFactor(0, 1)
         main_splitter.setStretchFactor(1, 0)
 
+        self.select_color_swatch('master')
+        self.update_swatch_icons()
+
     def create_slider(self, label: str, min_val: int, max_val: int, default: int,
                       parent_layout: QVBoxLayout, suffix="", callback=None):
         box = QHBoxLayout()
@@ -1011,9 +1556,7 @@ class PC98Studio(QMainWindow):
         slider.setValue(default)
         slider.setToolTip("Tip: Double-click slider to reset")
 
-        val_lbl = QLabel(f"{default}{suffix}")
-        val_lbl.setFixedWidth(42)
-        val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        spin = ValueSpinBox(min_val, max_val, default, suffix)
 
         btn_rst = QPushButton("↺")
         btn_rst.setFixedSize(26, 24)
@@ -1037,7 +1580,11 @@ class PC98Studio(QMainWindow):
         btn_rst.setToolTip(f"Reset {label} to {default}{suffix}")
         btn_rst.clicked.connect(lambda: slider.setValue(default))
 
-        slider.valueChanged.connect(lambda v: val_lbl.setText(f"{v}{suffix}"))
+        # Bidirectional synchronization between Slider and ValueSpinBox
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        spin.editingFinished.connect(self.commit_state)
+
         if callback:
             slider.valueChanged.connect(callback)
 
@@ -1046,11 +1593,14 @@ class PC98Studio(QMainWindow):
 
         box.addWidget(lbl)
         box.addWidget(slider)
-        box.addWidget(val_lbl)
+        box.addWidget(spin)
         box.addWidget(btn_rst)
         parent_layout.addLayout(box)
 
         slider.setProperty("default_value", default)
+        slider.setProperty("spin_box", spin)
+        slider.setProperty("suffix", suffix)
+        slider.setProperty("reset_button", btn_rst)
         self.all_sliders.append(slider)
         return slider
 
@@ -1061,12 +1611,114 @@ class PC98Studio(QMainWindow):
         self.is_slider_down = False
         self.commit_state()
 
+    def update_swatch_icons(self):
+        """Updates the swatch buttons to represent the target color range defined on the wheel."""
+        for key, data in self.color_hsl.items():
+            if key in self.swatch_buttons:
+                p0, p1, p2, p3 = data['range']
+                d_hard = (p2 - p1) % 360.0
+                center_h = (p1 + d_hard * 0.5) % 360.0
+                self.swatch_buttons[key].set_color_from_hue(center_h)
+
+    def select_color_swatch(self, key: str):
+        self.current_color_key = key
+        for k, btn in self.swatch_buttons.items():
+            btn.setSelected(k == key)
+
+        if key == 'master':
+            self.lbl_active_target.setText("Overall Shifts:")
+            self.hsl_wheel.set_color_data('master', [0, 0, 0, 0])
+            h, s, l = self.master_hsl
+        else:
+            name_cap = key.capitalize()
+            self.lbl_active_target.setText(f"{name_cap} Shifts:")
+            c_data = self.color_hsl[key]
+            self.hsl_wheel.set_color_data(key, c_data['range'])
+            h, s, l = c_data['shifts']
+
+        self.slider_hue_shift.blockSignals(True)
+        self.slider_sat_shift.blockSignals(True)
+        self.slider_light_shift.blockSignals(True)
+
+        self.slider_hue_shift.setValue(h)
+        self.slider_sat_shift.setValue(s)
+        self.slider_light_shift.setValue(l)
+
+        for s_widget, val in [
+            (self.slider_hue_shift, h),
+            (self.slider_sat_shift, s),
+            (self.slider_light_shift, l)
+        ]:
+            spin = s_widget.property("spin_box")
+            if spin:
+                spin.blockSignals(True)
+                spin.setValue(val)
+                spin.blockSignals(False)
+
+        self.slider_hue_shift.blockSignals(False)
+        self.slider_sat_shift.blockSignals(False)
+        self.slider_light_shift.blockSignals(False)
+
+    def on_active_hsl_slider_changed(self):
+        if self.is_updating:
+            return
+        h = self.slider_hue_shift.value()
+        s = self.slider_sat_shift.value()
+        l = self.slider_light_shift.value()
+
+        if self.current_color_key == 'master':
+            self.master_hsl = [h, s, l]
+        else:
+            self.color_hsl[self.current_color_key]['shifts'] = [h, s, l]
+
+        self.on_preprocessing_changed()
+
+    def on_wheel_range_changed(self, new_range: list):
+        if self.current_color_key != 'master':
+            self.color_hsl[self.current_color_key]['range'] = list(new_range)
+            self.update_swatch_icons()
+            self.on_preprocessing_changed()
+
+    def reset_hue_shift(self):
+        """Resets the active Hue shift to 0 and restores the original range parameters on the wheel."""
+        self.slider_hue_shift.setValue(0)
+        if self.current_color_key == 'master':
+            self.master_hsl[0] = 0
+        else:
+            def_range = self.DEFAULT_COLOR_HSL[self.current_color_key]['range']
+            self.color_hsl[self.current_color_key]['shifts'][0] = 0
+            self.color_hsl[self.current_color_key]['range'] = list(def_range)
+            self.hsl_wheel.set_color_data(self.current_color_key, def_range)
+        self.update_swatch_icons()
+        self.on_preprocessing_changed()
+        self.commit_state()
+
+    def reset_current_color_hsl(self):
+        """Resets all shifts (Hue, Sat, Light) and range parameters of the selected color."""
+        if self.current_color_key == 'master':
+            self.master_hsl = [0, 0, 0]
+        else:
+            def_range = self.DEFAULT_COLOR_HSL[self.current_color_key]['range']
+            self.color_hsl[self.current_color_key] = {
+                'shifts': [0, 0, 0],
+                'range': list(def_range)
+            }
+            self.hsl_wheel.set_color_data(self.current_color_key, def_range)
+
+        self.select_color_swatch(self.current_color_key)
+        self.update_swatch_icons()
+        self.on_preprocessing_changed()
+        self.commit_state()
+
     def serialize_state(self):
         return {
-            "contrast": self.slider_contrast.value(),
-            "bright": self.slider_bright.value(),
-            "sat": self.slider_sat.value(),
             "sharp": self.slider_sharp.value(),
+            "master_hsl": list(self.master_hsl),
+            "color_hsl": {
+                k: {'shifts': list(v['shifts']), 'range': list(v['range'])}
+                for k, v in self.color_hsl.items()
+            },
+            "active_color_key": self.current_color_key,
             "post_bright": self.slider_post_bright.value(),
             "post_sat": self.slider_post_sat.value(),
             "algo_idx": self.algo_combo.currentIndex(),
@@ -1099,6 +1751,9 @@ class PC98Studio(QMainWindow):
             if isinstance(v1, np.ndarray):
                 if not np.array_equal(v1, v2):
                     return False
+            elif isinstance(v1, dict):
+                if v1 != v2:
+                    return False
             elif v1 != v2:
                 return False
         return True
@@ -1128,11 +1783,16 @@ class PC98Studio(QMainWindow):
             return
         self.is_undoing = True
         self.is_updating = True
+        self.cached_framed_image = None
 
-        self.slider_contrast.setValue(state["contrast"])
-        self.slider_bright.setValue(state["bright"])
-        self.slider_sat.setValue(state["sat"])
         self.slider_sharp.setValue(state["sharp"])
+        self.master_hsl = list(state["master_hsl"])
+        self.color_hsl = {
+            k: {'shifts': list(v['shifts']), 'range': list(v['range'])}
+            for k, v in state["color_hsl"].items()
+        }
+        self.select_color_swatch(state["active_color_key"])
+
         self.slider_post_bright.setValue(state["post_bright"])
         self.slider_post_sat.setValue(state["post_sat"])
         self.algo_combo.setCurrentIndex(state["algo_idx"])
@@ -1164,14 +1824,17 @@ class PC98Studio(QMainWindow):
         self.active_palette = state["active_palette"].copy()
 
         if self.source_image is not None:
-            pre_adjusted_source = Image.fromarray(self.apply_preprocessing(self.source_image).astype(np.uint8))
-            self.original_image_palette = self.extract_base_palette(pre_adjusted_source)
+            small_src = self.source_image.resize((320, 200), Image.Resampling.BILINEAR)
+            pre_adjusted_small = Image.fromarray(self.apply_preprocessing(small_src).astype(np.uint8))
+            self.original_image_palette = self.extract_base_palette(pre_adjusted_small)
+
         self.populate_palette_dropdown()
         self.palette_combo.blockSignals(True)
         self.palette_combo.setCurrentIndex(state["palette_idx"])
         self.palette_combo.blockSignals(False)
 
         self.update_palette_swatches()
+        self.update_swatch_icons()
         self.is_updating = False
         self.process_render()
         self.update_compare_layout()
@@ -1181,24 +1844,89 @@ class PC98Studio(QMainWindow):
 
     def apply_dark_theme(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #1a1a1e; }
-            QWidget { color: #dcdce0; font-family: 'Segoe UI', Arial; font-size: 12px; }
-            QGroupBox { border: 1px solid #33333d; border-radius: 6px; margin-top: 10px; padding-top: 10px; font-weight: bold; color: #a0b0d0; }
-            QPushButton { background-color: #2a2a34; border: 1px solid #444455; border-radius: 4px; padding: 5px 10px; }
-            QPushButton:hover { background-color: #383848; border-color: #667799; }
-            QComboBox, QSpinBox { background-color: #24242e; border: 1px solid #444455; border-radius: 4px; padding: 4px; color: #fff; }
-            QSlider::groove:horizontal { height: 4px; background: #333340; border-radius: 2px; }
-            QSlider::sub-page:horizontal { background: #4a77a8; border-radius: 2px; }
-            QSlider::handle:horizontal { background: #d0d0e0; width: 14px; margin-top: -5px; margin-bottom: -5px; border-radius: 7px; }
-            QSplitter::handle { background-color: #2f2f3d; border: 1px solid #444455; border-radius: 4px; }
-            QSplitter::handle:hover { background-color: #4a77a8; }
-            QScrollArea { border: none; background: transparent; }
+            QMainWindow {
+                background-color: #1a1a1e;
+            }
+            QWidget {
+                color: #dcdce0;
+                font-family: 'Segoe UI', Arial;
+                font-size: 12px;
+            }
+            QScrollArea, QScrollArea > QWidget > QWidget {
+                background-color: #1a1a1e;
+                border: none;
+            }
+            QGroupBox {
+                background-color: #1a1a1e;
+                border: 1px solid #33333d;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+                color: #a0b0d0;
+            }
+            QPushButton {
+                background-color: #2a2a34;
+                border: 1px solid #444455;
+                border-radius: 4px;
+                padding: 5px 10px;
+                color: #dcdce0;
+            }
+            QPushButton:hover {
+                background-color: #383848;
+                border-color: #667799;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background-color: #1f1f27;
+            }
+            QComboBox, QSpinBox {
+                background-color: #24242e;
+                border: 1px solid #444455;
+                border-radius: 4px;
+                padding: 4px;
+                color: #ffffff;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #24242e;
+                color: #ffffff;
+                selection-background-color: #383848;
+                border: 1px solid #444455;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #333340;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4a77a8;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #d0d0e0;
+                width: 16px;
+                margin-top: -6px;
+                margin-bottom: -6px;
+                border-radius: 8px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #ffffff;
+            }
+            QSplitter::handle {
+                background-color: #2f2f3d;
+                border: 1px solid #444455;
+                border-radius: 4px;
+            }
+            QSplitter::handle:hover {
+                background-color: #4a77a8;
+            }
         """)
 
     def update_compare_layout(self):
         is_compare = self.compare_toggle.isChecked()
         self.compare_combo.setEnabled(is_compare)
         self.slider_split.setEnabled(is_compare)
+        self.spin_split.setEnabled(is_compare)
 
         if not is_compare:
             self.canvas_orig.hide()
@@ -1224,9 +1952,14 @@ class PC98Studio(QMainWindow):
             self.preview_splitter.setSizes([s1, s2])
 
     def on_sync_zoom(self, z: float):
+        val_int = int(z * 100)
         self.slider_view_zoom.blockSignals(True)
-        self.slider_view_zoom.setValue(int(z * 100))
+        self.slider_view_zoom.setValue(val_int)
         self.slider_view_zoom.blockSignals(False)
+
+        self.spin_view_zoom.blockSignals(True)
+        self.spin_view_zoom.setValue(val_int)
+        self.spin_view_zoom.blockSignals(False)
 
         self.canvas_orig.zoom_factor = z
         self.canvas_edited.zoom_factor = z
@@ -1250,7 +1983,16 @@ class PC98Studio(QMainWindow):
 
         self.canvas_orig.zoom_factor = zoom
         self.canvas_edited.zoom_factor = zoom
-        self.slider_view_zoom.setValue(int(zoom * 100))
+        val_int = int(zoom * 100)
+
+        self.slider_view_zoom.blockSignals(True)
+        self.slider_view_zoom.setValue(val_int)
+        self.slider_view_zoom.blockSignals(False)
+
+        self.spin_view_zoom.blockSignals(True)
+        self.spin_view_zoom.setValue(val_int)
+        self.spin_view_zoom.blockSignals(False)
+
         self.canvas_orig.update()
         self.canvas_edited.update()
 
@@ -1262,6 +2004,7 @@ class PC98Studio(QMainWindow):
     # --- Section Resets ---
     def reset_framing(self):
         self.is_updating = True
+        self.cached_framed_image = None
         self.slider_zoom.setValue(100)
         self.slider_pan_x.setValue(50)
         self.slider_pan_y.setValue(50)
@@ -1273,10 +2016,13 @@ class PC98Studio(QMainWindow):
 
     def reset_image_adjustments(self):
         self.is_updating = True
-        self.slider_contrast.setValue(0)
-        self.slider_bright.setValue(0)
-        self.slider_sat.setValue(0)
         self.slider_sharp.setValue(0)
+        self.master_hsl = [0, 0, 0]
+        self.color_hsl = {
+            k: {'shifts': [0, 0, 0], 'range': list(v['range'])}
+            for k, v in self.DEFAULT_COLOR_HSL.items()
+        }
+        self.select_color_swatch(self.current_color_key)
         self.is_updating = False
         self.on_preprocessing_changed()
         self.commit_state()
@@ -1298,8 +2044,9 @@ class PC98Studio(QMainWindow):
         self.is_updating = False
 
         if self.source_image is not None:
-            pre_adjusted_source = Image.fromarray(self.apply_preprocessing(self.source_image).astype(np.uint8))
-            self.original_image_palette = self.extract_base_palette(pre_adjusted_source)
+            small_src = self.source_image.resize((320, 200), Image.Resampling.BILINEAR)
+            pre_adjusted_small = Image.fromarray(self.apply_preprocessing(small_src).astype(np.uint8))
+            self.original_image_palette = self.extract_base_palette(pre_adjusted_small)
             self.populate_palette_dropdown()
             self.palette_combo.setCurrentIndex(0)
             self.on_preset_changed(0)
@@ -1315,7 +2062,10 @@ class PC98Studio(QMainWindow):
         if not file_path:
             return
         self.source_image = Image.open(file_path).convert("RGB")
-        self.original_image_palette = self.extract_base_palette(self.source_image)
+        self.cached_framed_image = None
+        small_src = self.source_image.resize((320, 200), Image.Resampling.BILINEAR)
+        pre_adjusted_small = Image.fromarray(self.apply_preprocessing(small_src).astype(np.uint8))
+        self.original_image_palette = self.extract_base_palette(pre_adjusted_small)
         self.reset_framing()
         self.reset_image_adjustments()
         self.reset_post_color_editing()
@@ -1354,6 +2104,9 @@ class PC98Studio(QMainWindow):
         if self.source_image is None:
             return None
 
+        if self.cached_framed_image is not None:
+            return self.cached_framed_image
+
         tw, th = self.get_target_dimensions()
         sw, sh = self.source_image.width, self.source_image.height
         zoom = max(1.0, self.slider_zoom.value() / 100.0)
@@ -1376,16 +2129,10 @@ class PC98Studio(QMainWindow):
         top = int(round(max(0, sh - crop_h) * pan_y))
 
         cropped = self.source_image.crop((left, top, left + crop_w, top + crop_h))
-        return cropped.resize((tw, th), Image.Resampling.LANCZOS)
+        self.cached_framed_image = cropped.resize((tw, th), Image.Resampling.LANCZOS)
+        return self.cached_framed_image
 
     def apply_preprocessing(self, img: Image.Image) -> np.ndarray:
-        c_val = 1.0 + (self.slider_contrast.value() / 100.0)
-        img = ImageEnhance.Contrast(img).enhance(max(0.1, c_val))
-        b_val = 1.0 + (self.slider_bright.value() / 100.0)
-        img = ImageEnhance.Brightness(img).enhance(max(0.1, b_val))
-        s_val = 1.0 + (self.slider_sat.value() / 100.0)
-        img = ImageEnhance.Color(img).enhance(max(0.0, s_val))
-
         sh_val = self.slider_sharp.value()
         if sh_val > 0:
             factor = 1.0 + (sh_val / 50.0)
@@ -1394,7 +2141,9 @@ class PC98Studio(QMainWindow):
             blur_radius = (-sh_val / 100.0) * 3.0
             img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
 
-        return np.array(img, dtype=np.float32)
+        arr = np.array(img, dtype=np.float32)
+        arr = apply_hsl_transform(arr, self.master_hsl, self.color_hsl)
+        return arr
 
     def apply_post_color_editing(self, arr: np.ndarray) -> np.ndarray:
         post_b = self.slider_post_bright.value()
@@ -1555,8 +2304,9 @@ class PC98Studio(QMainWindow):
 
     def on_eight_color_toggled(self):
         if self.source_image is not None:
-            pre_adjusted_source = Image.fromarray(self.apply_preprocessing(self.source_image).astype(np.uint8))
-            self.original_image_palette = self.extract_base_palette(pre_adjusted_source)
+            small_src = self.source_image.resize((320, 200), Image.Resampling.BILINEAR)
+            pre_adjusted_small = Image.fromarray(self.apply_preprocessing(small_src).astype(np.uint8))
+            self.original_image_palette = self.extract_base_palette(pre_adjusted_small)
         self.populate_palette_dropdown()
         self.on_preset_changed(self.palette_combo.currentIndex())
         self.commit_state()
@@ -1569,14 +2319,17 @@ class PC98Studio(QMainWindow):
     def on_framing_changed(self):
         if self.is_updating or self.source_image is None:
             return
+        self.cached_framed_image = None
         self.process_render()
         self.commit_state()
 
     def on_preprocessing_changed(self):
         if self.is_updating or self.source_image is None:
             return
-        pre_adjusted_source = Image.fromarray(self.apply_preprocessing(self.source_image).astype(np.uint8))
-        self.original_image_palette = self.extract_base_palette(pre_adjusted_source)
+
+        small_src = self.source_image.resize((320, 200), Image.Resampling.BILINEAR)
+        pre_adjusted_small = Image.fromarray(self.apply_preprocessing(small_src).astype(np.uint8))
+        self.original_image_palette = self.extract_base_palette(pre_adjusted_small)
         self.populate_palette_dropdown()
 
         curr_idx = self.palette_combo.currentIndex()
@@ -1678,13 +2431,12 @@ class PC98Studio(QMainWindow):
         rgb_output = self.active_palette[self.processed_indices]
         qimg_edited = QImage(rgb_output.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
 
-        orig_bytes = np.array(framed_orig, dtype=np.uint8)
-        qimg_orig = QImage(orig_bytes.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
-
         stretch = 1.2 if self.aspect_toggle.isChecked() else 1.0
-
         self.canvas_edited.set_image(qimg_edited, stretch)
+
         if self.compare_toggle.isChecked():
+            orig_bytes = np.array(framed_orig, dtype=np.uint8)
+            qimg_orig = QImage(orig_bytes.data, w, h, w * 3, QImage.Format.Format_RGB888).copy()
             self.canvas_orig.set_image(qimg_orig, stretch)
 
         num_colors = 8 if self.eight_color_toggle.isChecked() else 16
@@ -1735,7 +2487,7 @@ class PC98Studio(QMainWindow):
             return
         num_colors = 8 if self.eight_color_toggle.isChecked() else 16
         try:
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 if path.endswith(".gpl"):
                     f.write("GIMP Palette\nChannels: RGB\n#\n")
                     for i in range(num_colors):
@@ -1765,7 +2517,6 @@ class PC98Studio(QMainWindow):
         full_pal[:num_colors] = self.active_palette[:num_colors]
         indexed_img.putpalette(full_pal.flatten().tolist())
 
-        # Nearest-Neighbor Integer Scaling (1x, 2x default, 4x, 8x)
         upscale_idx = self.export_upscale_combo.currentIndex()
         scale = 1 if upscale_idx == 0 else 2 if upscale_idx == 1 else 4 if upscale_idx == 2 else 8
         apply_crt = self.aspect_toggle.isChecked()
@@ -1791,11 +2542,12 @@ if __name__ == "__main__":
     try:
         print("[PC-98 STUDIO] [4/4] Creating application window...")
         app = QApplication(sys.argv)
-        
+        app.setStyle("Fusion")
+
         icon_path = resource_path("app_icon.ico")
         if os.path.exists(icon_path):
             app.setWindowIcon(QIcon(icon_path))
-            
+
         window = PC98Studio()
         window.show()
         window.raise_()
