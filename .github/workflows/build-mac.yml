@@ -1,39 +1,51 @@
-name: Build macOS App
+name: Build macOS Application (Apple Silicon)
 
 on:
-  workflow_dispatch: # Allows manual trigger from GitHub UI
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  build-macos:
-    runs-on: macos-latest
+  build-mac:
+    runs-on: macos-14  # Apple Silicon M-series runner
 
     steps:
-      - name: Check out repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          architecture: "arm64"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install PyQt6 pillow numpy pyinstaller
+          pip install numpy pillow PyQt6 pyinstaller
 
-      - name: Build with PyInstaller
+      - name: Build macOS .app Bundle (Apple Silicon Only)
         run: |
-          pyinstaller --windowed --onedir --clean --name="PC-98 STUDIO" pc98_studio.py
+          python -m PyInstaller \
+            --windowed \
+            --clean \
+            --target-arch arm64 \
+            --name="PC-98 STUDIO" \
+            --exclude-module PyQt6.QtNetwork \
+            --exclude-module PyQt6.QtQml \
+            --exclude-module PyQt6.QtQuick \
+            --exclude-module PyQt6.QtSql \
+            --exclude-module PyQt6.QtPdf \
+            --exclude-module PyQt6.QtTest \
+            pc98_studio.py
 
-      - name: Zip .app Bundle
+      - name: Compress App Bundle
         run: |
           cd dist
-          zip -r "PC-98-STUDIO-macOS.zip" "PC-98 STUDIO.app"
+          zip -r "PC-98-STUDIO-macOS-arm64.zip" "PC-98 STUDIO.app"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PC-98-STUDIO-macOS
-          path: dist/PC-98-STUDIO-macOS.zip
+          name: PC-98-STUDIO-macOS-arm64
+          path: dist/PC-98-STUDIO-macOS-arm64.zip
